@@ -1,13 +1,11 @@
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 from typing import Literal, Any, AsyncIterable
 from dotenv import load_dotenv
-import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
 
 class AgentCapabilities(BaseModel):
     streaming: bool = True
@@ -34,13 +32,14 @@ class AgentCard(BaseModel):
     skills: list[AgentSkill]
     authentication: AgentAuthentication
 
-class ChatGoogleGenerativeAI:
+class ChatModel:
     def __init__(self, model: str):
         self.model = model
-        self.llm = genai.GenerativeModel(model)
+        api_key = SecretStr(GOOGLE_API_KEY) if GOOGLE_API_KEY else None
+        self.llm = ChatGoogleGenerativeAI(model=model, api_key=api_key)
     def chat(self, prompt: str) -> str:
-        response = self.llm.generate_content(prompt)
-        return response.text if hasattr(response, 'text') else str(response)
+        response = self.llm.invoke(prompt)
+        return str(response.content) if hasattr(response, 'content') else str(response)
 
 class ReportFormat(BaseModel):
     status: Literal['completed', 'error'] = 'completed'
@@ -52,7 +51,7 @@ class ReportingAgent:
     SUPPORTED_CONTENT_TYPES = ["application/json"]
 
     def __init__(self, host: str = 'localhost', port: int = 5002):
-        self.model = ChatGoogleGenerativeAI(model='gemini-1.5-flash')
+        self.model = ChatModel(model='gemini-1.5-flash')
         self.agent_card = self.get_agent_card(host, port)
 
     @staticmethod
