@@ -5,7 +5,7 @@ __pycache__/
 blog.md
 # C extensions
 *.so
-
+/blog.md
 # Distribution / packaging
 .Python
 build/

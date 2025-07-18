@@ -1,16 +1,92 @@
+import logging
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.types import (
+    InternalError,
+    InvalidParamsError,
+    Part,
+    Task,
+    TaskState,
+    TextPart,
+    UnsupportedOperationError,
+)
+from a2a.utils import (
+    new_agent_text_message,
+    new_task,
+)
+from a2a.utils.errors import ServerError
+
 from currency_agent.agent import CurrencyAgent
-from typing import Any, AsyncIterable
 
-class CurrencyAgentExecutor:
-    def __init__(self, agent: CurrencyAgent):
-        self.agent = agent
 
-    async def on_message_send(self, query: str, session_id: str) -> dict[str, Any]:
-        return await self.agent.invoke(query, session_id)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    async def on_message_stream(self, query: str, session_id: str) -> AsyncIterable[dict[str, Any]]:
-        async for chunk in self.agent.stream(query, session_id):
-            yield chunk
 
-    async def on_message_send_with_report(self, query: str, session_id: str) -> dict[str, Any]:
-        return await self.agent.invoke_with_reporting(query, session_id)
+class CurrencyAgentExecutor(AgentExecutor):
+    """Currency Conversion AgentExecutor following A2A protocol."""
+
+    def __init__(self):
+        self.agent = CurrencyAgent()
+
+    async def execute(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+    ) -> None:
+        error = self._validate_request(context)
+        if error:
+            raise ServerError(error=InvalidParamsError())
+
+        query = context.get_user_input()
+        task = context.current_task
+        if not task:
+            task = new_task(context.message) # type: ignore
+            await event_queue.enqueue_event(task)
+        updater = TaskUpdater(event_queue, task.id, task.contextId)
+        try:
+            async for item in self.agent.stream(query, task.contextId):
+                is_task_complete = item['is_task_complete']
+                require_user_input = item['require_user_input']
+
+                if not is_task_complete and not require_user_input:
+                    await updater.update_status(
+                        TaskState.working,
+                        new_agent_text_message(
+                            item['content'],
+                            task.contextId,
+                            task.id,
+                        ),
+                    )
+                elif require_user_input:
+                    await updater.update_status(
+                        TaskState.input_required,
+                        new_agent_text_message(
+                            item['content'],
+                            task.contextId,
+                            task.id,
+                        ),
+                        final=True,
+                    )
+                    break
+                else:
+                    await updater.add_artifact(
+                        [Part(root=TextPart(text=item['content']))],
+                        name='currency_conversion_with_report',
+                    )
+                    await updater.complete()
+                    break
+
+        except Exception as e:
+            logger.error(f'An error occurred while streaming the response: {e}')
+            raise ServerError(error=InternalError()) from e
+
+    def _validate_request(self, context: RequestContext) -> bool:
+        return False
+
+    async def cancel(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        raise ServerError(error=UnsupportedOperationError())

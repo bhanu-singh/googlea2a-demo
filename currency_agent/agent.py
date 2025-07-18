@@ -1,223 +1,268 @@
 import os
+from collections.abc import AsyncIterable
+from typing import Any, Literal
+from uuid import uuid4
+
 import httpx
-from pydantic import BaseModel, SecretStr
-from typing import Literal, Any, AsyncIterable
-from dotenv import load_dotenv
-import google.generativeai as genai
-import re
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.getcwd(), ".env"))
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import (
+    MessageSendParams,
+    SendMessageRequest,
+)
 
-class ResponseFormat(BaseModel):
-    status: str
-    message: str
+load_dotenv()
 
-class AgentCapabilities(BaseModel):
-    streaming: bool = True
-    pushNotifications: bool = True
+memory = MemorySaver()
 
-class AgentSkill(BaseModel):
-    id: str
-    name: str
-    description: str
-    tags: list[str]
-    examples: list[str]
 
-class AgentAuthentication(BaseModel):
-    schemes: list[str]
-
-class AgentCard(BaseModel):
-    name: str
-    description: str
-    url: str
-    version: str
-    defaultInputModes: list[str]
-    defaultOutputModes: list[str]
-    capabilities: AgentCapabilities
-    skills: list[AgentSkill]
-    authentication: AgentAuthentication
-
-async def get_exchange_rate(currency_from: str = 'USD', currency_to: str = 'EUR', currency_date: str = 'latest') -> dict:
-    """
-    Fetch the exchange rate between two currencies for a given date using the Frankfurter API.
+@tool
+def get_exchange_rate(
+    currency_from: str = 'USD',
+    currency_to: str = 'EUR',
+    currency_date: str = 'latest',
+):
+    """Use this to get current exchange rate.
 
     Args:
-        currency_from (str): The source currency code (e.g., 'USD').
-        currency_to (str): The target currency code (e.g., 'EUR').
-        currency_date (str): The date for the exchange rate (e.g., 'latest' or '2023-01-01').
+        currency_from: The currency to convert from (e.g., "USD").
+        currency_to: The currency to convert to (e.g., "EUR").
+        currency_date: The date for the exchange rate or "latest". Defaults to
+            "latest".
 
     Returns:
-        dict: The API response containing exchange rate data or an error message.
+        A dictionary containing the exchange rate data, or an error message if
+        the request fails.
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f'https://api.frankfurter.app/{currency_date}',
-                params={'from': currency_from, 'to': currency_to},
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data
+        response = httpx.get(
+            f'https://api.frankfurter.app/{currency_date}',
+            params={'from': currency_from, 'to': currency_to},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if 'rates' not in data:
+            return {'error': 'Invalid API response format.'}
+        return data
     except httpx.HTTPError as e:
         return {'error': f'API request failed: {e}'}
+    except ValueError:
+        return {'error': 'Invalid JSON response from API.'}
 
-async def call_reporting_agent(conversion_result: dict, session_id: str = "default-session") -> dict:
-    """LangGraph tool: Call the Reporting Agent to generate a report for a conversion result."""
-    import httpx
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            'http://localhost:5002/a2a',
-            json={
-                'method': 'message/send',
-                'params': {
-                    'conversion_result': conversion_result,
+
+@tool
+async def call_reporting_agent(conversion_result: dict, session_id: str = "default-session"):
+    """Call the Reporting Agent to generate a report for a conversion result using A2A protocol.
+    
+    Args:
+        conversion_result: The currency conversion result data containing from, to, rate, and raw data
+        session_id: Session identifier for the request
+        
+    Returns:
+        A dictionary containing the report or error information
+    """
+    try:
+        reporting_agent_url = 'http://localhost:5002'
+        
+        async with httpx.AsyncClient(timeout=30.0) as httpx_client:
+            # Initialize A2A client for reporting agent
+            resolver = A2ACardResolver(
+                httpx_client=httpx_client,
+                base_url=reporting_agent_url,
+            )
+            
+            # Get the reporting agent card
+            agent_card = await resolver.get_agent_card()
+            client = A2AClient(httpx_client=httpx_client, agent_card=agent_card)
+            
+            # Prepare the message for the reporting agent
+            import json
+            message_text = f"Generate a comprehensive report for this currency conversion: {json.dumps(conversion_result, indent=2)}"
+            
+            # Create A2A request
+            request = SendMessageRequest(
+                id=str(uuid4()),
+                params=MessageSendParams(
+                    message={
+                        'role': 'user',
+                        'parts': [{'kind': 'text', 'text': message_text}],
+                        'messageId': uuid4().hex,
+                    }
+                )
+            )
+            
+            # Send request to reporting agent
+            response = await client.send_message(request)
+            result = response.root.result
+            
+            if result.status.state == 'completed':
+                # Extract the report from artifacts
+                if hasattr(result, 'artifacts') and result.artifacts:
+                    report_content = ""
+                    for artifact in result.artifacts:
+                        if artifact.parts:
+                            for part in artifact.parts:
+                                if hasattr(part, 'text'):
+                                    report_content += part.text
+                    
+                    return {
+                        'status': 'completed',
+                        'report': report_content,
+                        'summary': f"Generated report for {conversion_result.get('from', 'N/A')} to {conversion_result.get('to', 'N/A')} conversion",
+                        'session_id': session_id
+                    }
+                else:
+                    return {
+                        'status': 'completed',
+                        'report': 'Report generated but no content available',
+                        'summary': 'Report generation completed',
+                        'session_id': session_id
+                    }
+            else:
+                return {
+                    'status': 'error',
+                    'report': f'Reporting agent returned status: {result.status.state}',
+                    'summary': 'Report generation failed',
                     'session_id': session_id
                 }
-            }
-        )
-        if response.status_code == 200:
-            return response.json().get('result', {})
-        else:
-            return {'status': 'error', 'report': 'Failed to get report from Reporting Agent'}
+                
+    except Exception as e:
+        return {
+            'status': 'error',
+            'report': f'Error calling reporting agent: {str(e)}',
+            'summary': 'Failed to connect to reporting agent',
+            'session_id': session_id
+        }
+
+
+class ResponseFormat(BaseModel):
+    """Respond to the user in this format."""
+
+    status: Literal['input_required', 'completed', 'error'] = 'input_required'
+    message: str
+
 
 class CurrencyAgent:
-    SYSTEM_INSTRUCTION = "You are a helpful currency conversion agent."
-    RESPONSE_FORMAT_INSTRUCTION = "Respond to the user in the ResponseFormat schema."
-    SUPPORTED_CONTENT_TYPES = ["text/plain"]
+    """CurrencyAgent - a specialized assistant for currency conversions."""
 
-    def __init__(self, host: str = 'localhost', port: int = 8000):
-        api_key = SecretStr(GOOGLE_API_KEY) if GOOGLE_API_KEY else None
-        self.model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", api_key=api_key)
+    SYSTEM_INSTRUCTION = (
+        'You are a specialized assistant for currency conversions. '
+        "Your primary purpose is to use the 'get_exchange_rate' tool to get currency exchange rates, "
+        "and then use the 'call_reporting_agent' tool to generate comprehensive reports about the conversions. "
+        'Always follow this workflow: 1) Get exchange rate, 2) Call reporting agent with the results. '
+        'If the user asks about anything other than currency conversion or exchange rates, '
+        'politely state that you cannot help with that topic and can only assist with currency-related queries. '
+        'Do not attempt to answer unrelated questions or use tools for other purposes.'
+    )
+
+    FORMAT_INSTRUCTION = (
+        'Set response status to input_required if the user needs to provide more information to complete the request. '
+        'Set response status to error if there is an error while processing the request. '
+        'Set response status to completed if the request is complete and both exchange rate and report have been generated.'
+    )
+
+    def __init__(self):
+        model_source = os.getenv('model_source', 'google')
+        if model_source == 'google':
+            self.model = ChatGoogleGenerativeAI(model='gemini-2.0-flash')
+        else:
+            self.model = ChatOpenAI(
+                model=os.getenv('TOOL_LLM_NAME'),
+                openai_api_key=os.getenv('API_KEY', 'EMPTY'),
+                openai_api_base=os.getenv('TOOL_LLM_URL'),
+                temperature=0,
+            )
         self.tools = [get_exchange_rate, call_reporting_agent]
-        self.agent_card = self.get_agent_card(host, port)
-        # LangGraph integration
-        self.memory = MemorySaver()
+
         self.graph = create_react_agent(
             self.model,
             tools=self.tools,
-            checkpointer=self.memory,
+            checkpointer=memory,
             prompt=self.SYSTEM_INSTRUCTION,
-            response_format=(self.RESPONSE_FORMAT_INSTRUCTION, ResponseFormat),
+            response_format=(self.FORMAT_INSTRUCTION, ResponseFormat),
         )
 
-    @staticmethod
-    def get_agent_card(host: str, port: int) -> AgentCard:
-        capabilities = AgentCapabilities(streaming=True, pushNotifications=True)
-        skill = AgentSkill(
-            id='convert_currency',
-            name='Currency Exchange Rates Tool',
-            description='Helps with exchange values between various currencies',
-            tags=['currency conversion', 'currency exchange'],
-            examples=['What is exchange rate between USD and GBP?'],
-        )
-        return AgentCard(
-            name='Currency Agent',
-            description='Helps with exchange rates for currencies',
-            url=f'http://{host}:{port}/',
-            version='1.0.0',
-            defaultInputModes=CurrencyAgent.SUPPORTED_CONTENT_TYPES,
-            defaultOutputModes=CurrencyAgent.SUPPORTED_CONTENT_TYPES,
-            capabilities=capabilities,
-            skills=[skill],
-            authentication=AgentAuthentication(schemes=['public']),
-        )
+    async def stream(self, query, context_id) -> AsyncIterable[dict[str, Any]]:
+        inputs = {'messages': [('user', query)]}
+        config = {'configurable': {'thread_id': context_id}}
 
-    def extract_currencies(self, query: str) -> tuple[str, str]:
-        prompt = (
-            f"""Extract the source and target currency codes from the following query. "
-            f"Return as JSON: {{'from': 'USD', 'to': 'EUR'}}.\nQuery: {query}"""
-        )
-        response = self.model.invoke(prompt)
-        print("[DEBUG] Gemini response for currency extraction:", response)
-        import json
-        try:
-            response_text = str(response)
-            data = json.loads(response_text.replace("'", '"'))
-            currency_from = data.get('from', '')
-            currency_to = data.get('to', '')
-            if currency_from and currency_to:
-                return currency_from, currency_to
-        except Exception as e:
-            print("[DEBUG] Gemini extraction failed:", e)
-        # Fallback: regex extraction for 3-letter currency codes
-        matches = re.findall(r'([A-Z]{3})', query)
-        if len(matches) >= 2:
-            print("[DEBUG] Fallback regex extraction:", matches[:2])
-            return matches[0], matches[1]
-        return '', ''
-
-    async def invoke(self, query: str, session_id: str) -> dict[str, Any]:
-        config: RunnableConfig = {'configurable': {'thread_id': session_id}}
-        # Use LangGraph agent for reasoning and tool use
-        result = await self.graph.ainvoke({'messages': [('user', query)]}, config)
-        return self.get_agent_response(config)
-
-    def get_agent_response(self, config: RunnableConfig) -> dict[str, Any]:
-        # Simplified response for now
-        return {'status': 'completed', 'message': 'Currency conversion completed'}
-
-    async def stream(self, query: str, session_id: str) -> AsyncIterable[dict[str, Any]]:
-        inputs: dict[str, Any] = {'messages': [('user', query)]}
-        config: RunnableConfig = {'configurable': {'thread_id': session_id}}
-        async for item in self.graph.astream(inputs, config, stream_mode='values'):
+        for item in self.graph.stream(inputs, config, stream_mode='values'):
             message = item['messages'][-1]
-            if isinstance(message, AIMessage) and getattr(message, 'tool_calls', None):
-                yield {
-                    'is_task_complete': False,
-                    'require_user_input': False,
-                    'content': 'Looking up the exchange rates...'
-                }
+            if (
+                isinstance(message, AIMessage)
+                and message.tool_calls
+                and len(message.tool_calls) > 0
+            ):
+                # Check which tool is being called
+                tool_name = message.tool_calls[0].get('name', '')
+                if tool_name == 'get_exchange_rate':
+                    yield {
+                        'is_task_complete': False,
+                        'require_user_input': False,
+                        'content': 'Looking up the exchange rates...',
+                    }
+                elif tool_name == 'call_reporting_agent':
+                    yield {
+                        'is_task_complete': False,
+                        'require_user_input': False,
+                        'content': 'Generating comprehensive report...',
+                    }
+                else:
+                    yield {
+                        'is_task_complete': False,
+                        'require_user_input': False,
+                        'content': 'Processing your request...',
+                    }
             elif isinstance(message, ToolMessage):
                 yield {
                     'is_task_complete': False,
                     'require_user_input': False,
-                    'content': 'Processing the exchange rates...'
+                    'content': 'Processing the results...',
                 }
+
         yield self.get_agent_response(config)
 
-    async def invoke_with_reporting(self, query: str, session_id: str) -> dict[str, Any]:
-        currency_from, currency_to = self.extract_currencies(query)
-        if currency_from and currency_to:
-            data = await get_exchange_rate(currency_from, currency_to)
-            if 'error' in data:
-                return ResponseFormat(status='error', message=data['error']).model_dump()
-            rate = data.get('rates', {}).get(currency_to)
-            if rate:
-                conversion_result = {
-                    'from': currency_from,
-                    'to': currency_to,
-                    'rate': rate,
-                    'raw': data
+    def get_agent_response(self, config):
+        current_state = self.graph.get_state(config)
+        structured_response = current_state.values.get('structured_response')
+        if structured_response and isinstance(
+            structured_response, ResponseFormat
+        ):
+            if structured_response.status == 'input_required':
+                return {
+                    'is_task_complete': False,
+                    'require_user_input': True,
+                    'content': structured_response.message,
                 }
-                # Send to Reporting Agent
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        'http://localhost:5002/a2a',
-                        json={
-                            'method': 'message/send',
-                            'params': {
-                                'conversion_result': conversion_result,
-                                'session_id': session_id
-                            }
-                        }
-                    )
-                    if response.status_code == 200:
-                        report = response.json().get('result', {})
-                        return {
-                            'status': 'completed',
-                            'message': f"1 {currency_from} = {rate} {currency_to}",
-                            'report': report
-                        }
-                    else:
-                        return ResponseFormat(status='error', message='Failed to get report from Reporting Agent').model_dump()
-            else:
-                return ResponseFormat(status='error', message="Could not fetch rate.").model_dump()
-        else:
-            return ResponseFormat(status='input_required', message="Please specify both source and target currencies.").model_dump()
+            if structured_response.status == 'error':
+                return {
+                    'is_task_complete': False,
+                    'require_user_input': True,
+                    'content': structured_response.message,
+                }
+            if structured_response.status == 'completed':
+                return {
+                    'is_task_complete': True,
+                    'require_user_input': False,
+                    'content': structured_response.message,
+                }
+
+        return {
+            'is_task_complete': False,
+            'require_user_input': True,
+            'content': (
+                'We are unable to process your request at the moment. '
+                'Please try again.'
+            ),
+        }
+
+    SUPPORTED_CONTENT_TYPES = ['text', 'text/plain']
